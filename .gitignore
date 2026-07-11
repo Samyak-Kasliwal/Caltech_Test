@@ -1,0 +1,4 @@
+# 编译缓存 pyc
+__pycache__/
+*.py[cod]
+*$py.class
