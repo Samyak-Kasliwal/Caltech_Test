@@ -1,0 +1,70 @@
+{
+  "data": {
+    "data_path": "Caltech/calms21_task1_train_distance_lt_330.npy",
+    "num_mice": 2,
+    "num_joints": 7,
+    "coord_dim": 2,
+    "num_behavior_classes": 4,
+    "a_history_frames": 9,
+    "a_include_current": true,
+    "b_history_frames": 4,
+    "behavior_label_mode": "history_plus_current",
+    "use_scores": false
+  },
+  "embedding": {
+    "joint_input_dim": 2,
+    "joint_embedding_dim": 16,
+    "pose_embedding_dim": 64,
+    "velocity_embedding_dim": 32,
+    "behavior_embedding_dim": 16,
+    "mouse_embedding_dim": 128,
+    "interaction_input_dim": 5,
+    "interaction_embedding_dim": 32,
+    "frame_mlp_hidden_dim": 128,
+    "dropout": 0.0
+  },
+  "sequence": {
+    "model_type": "lstm",
+    "input_dim": 128,
+    "interaction_input_dim": 32,
+    "hidden_dim": 128,
+    "interaction_hidden_dim": 64,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "bidirectional": false
+  },
+  "pooling": {
+    "pooling_type": "auto",
+    "attention_hidden_dim": 64
+  },
+  "head": {
+    "hidden_dims": [
+      256,
+      128
+    ],
+    "output_dim": 14,
+    "dropout": 0.0
+  },
+  "training": {
+    "num_folds": 5,
+    "split_mode": "sequence_level",
+    "seed": 42,
+    "batch_size": 256,
+    "epochs": 10,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "num_workers": 0,
+    "device": "auto",
+    "max_train_batches": null,
+    "max_val_batches": null,
+    "output_root": "Model/asymmetric_pose_case/runs",
+    "experiment_name": "baseline_lstm_10epochs",
+    "save_checkpoints": true,
+    "save_best_checkpoint": true,
+    "save_last_checkpoint": true,
+    "export_validation_predictions": true
+  },
+  "normalization": {
+    "eps": 1e-06
+  }
+}

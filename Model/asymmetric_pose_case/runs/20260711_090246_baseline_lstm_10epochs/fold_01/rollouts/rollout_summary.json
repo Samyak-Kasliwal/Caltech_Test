@@ -1,0 +1,12 @@
+{
+  "sequence_id": "task1/train/mouse003_task1_annotator1",
+  "start_t": 100,
+  "rollout_length": 20,
+  "checkpoint_path": "Model\\asymmetric_pose_case\\runs\\20260711_090246_baseline_lstm_10epochs\\fold_01\\checkpoints\\best.pt",
+  "output_path": "Model\\asymmetric_pose_case\\runs\\20260711_090246_baseline_lstm_10epochs\\fold_01\\rollouts\\mouse003_start100_len20.npz",
+  "mean_mse": 6510.17431640625,
+  "mean_rmse": 76.6553726196289,
+  "mean_joint_l2": 98.66912841796875,
+  "final_frame_mse": 9986.9462890625,
+  "final_frame_rmse": 99.93470764160156
+}
