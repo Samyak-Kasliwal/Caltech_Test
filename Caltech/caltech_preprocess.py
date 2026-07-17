@@ -152,13 +152,23 @@ def filter_dataset_by_distance(dataset, distance_limit):
 # {
 #   "body": {
 #       "node": {
-#           <node_name>: {"position": (x, y), "node_velocity": (vx, vy)},
+#           <node_name>: {
+#               "position": (x, y),
+#               "node_velocity": (vx, vy),
+#               "score": float,   # CalMS21's own tracking-confidence score
+#                                 # for this node, 0 (low) to 1 (high)
+#           },
 #           ... for all 7 nodes in NODE_NAMES order ...
 #       },
 #       "internode_distance": [12 floats, in INTERNODE_PAIRS order],
 #   },
 #   "interaction": {
-#       "annotation_tag": [one-hot list, ordered by behavior id],
+#       "annotation_tag": one-hot list, length 4, ordered
+#           [attack, investigation, mount, other]:
+#           attack        -> [1, 0, 0, 0]
+#           investigation -> [0, 1, 0, 0]
+#           mount         -> [0, 0, 1, 0]
+#           other         -> [0, 0, 0, 1]
 #       "intruder_or_resident_tag": 0 (resident) or 1 (intruder),
 #       "mouse_midpoint_distance": float,
 #       "head_angle": float (signed degrees, -180..180),
@@ -171,6 +181,10 @@ def filter_dataset_by_distance(dataset, distance_limit):
 # intruder_frames  = [Int_Frame_1, Int_Frame_2, ...]
 # resident_frames  = [Res_Frame_1, Res_Frame_2, ...]
 # 每个 Int_Frame_i / Res_Frame_i 都是上面这样的字典结构。
+# 每个 node 除了 position / node_velocity，还新增了 "score"
+# （CalMS21 原始数据自带的、该 node 的追踪置信度，0~1）。
+# annotation_tag 是长度为 4 的 one-hot 列表，顺序固定为
+# [attack, investigation, mount, other]，见上面英文注释中的对应关系。
 # ============================================================
 
 
@@ -214,6 +228,20 @@ def get_node_position(keypoints, frame_idx, mouse_id, node_name):
     """
     node_idx = NODE_INDEX[node_name]
     return keypoints[frame_idx, mouse_id, :, node_idx].astype(float)
+
+
+def get_node_score(scores, frame_idx, mouse_id, node_name):
+    """Return CalMS21's own tracking-confidence score for one node.
+
+    返回 CalMS21 原始数据里，某一帧、某一只鼠、某一个 node 的追踪置信度分数。
+    "scores" has shape (frames, mouse, node), unitless, range 0 (lowest
+    confidence) to 1 (highest confidence) -- this is a value CalMS21 already
+    provides per node, we are not computing it ourselves.
+    "scores" 的形状是 (帧数, 鼠, node)，取值范围 0（置信度最低）到
+    1（置信度最高），这是 CalMS21 数据自带的值，不是脚本计算出来的。
+    """
+    node_idx = NODE_INDEX[node_name]
+    return float(scores[frame_idx, mouse_id, node_idx])
 
 
 def compute_node_velocity(keypoints, frame_idx, window_start, mouse_id, node_name):
@@ -293,10 +321,10 @@ def compute_head_angle(keypoints, frame_idx, mouse_id, other_mouse_midpoint):
     return float(np.degrees(angle_radians))
 
 
-def build_body_section(keypoints, frame_idx, window_start, mouse_id):
+def build_body_section(keypoints, scores, frame_idx, window_start, mouse_id):
     """Build the "body" sub-dictionary for one mouse at one frame.
 
-    为某只鼠在某一帧构建 "body" 字段：包含每个 node 的位置/速度，
+    为某只鼠在某一帧构建 "body" 字段：包含每个 node 的位置/速度/置信度分数，
     以及 12 个 internode_distance。
     """
     node_section = {}
@@ -305,9 +333,11 @@ def build_body_section(keypoints, frame_idx, window_start, mouse_id):
         velocity = compute_node_velocity(
             keypoints, frame_idx, window_start, mouse_id, node_name
         )
+        score = get_node_score(scores, frame_idx, mouse_id, node_name)
         node_section[node_name] = {
             "position": (float(position[0]), float(position[1])),
             "node_velocity": (float(velocity[0]), float(velocity[1])),
+            "score": score,
         }
 
     return {
@@ -338,14 +368,20 @@ def build_interaction_section(
 
 
 def build_frame(
-    keypoints, frame_idx, window_start, mouse_id, other_mouse_id, annotation_onehot
+    keypoints,
+    scores,
+    frame_idx,
+    window_start,
+    mouse_id,
+    other_mouse_id,
+    annotation_onehot,
 ):
     """Build one frame dict (an "Int_Frame_i" or "Res_Frame_i") for one mouse.
 
     构建单只鼠、单帧的数据字典（对应 "Int_Frame_i" 或 "Res_Frame_i"）。
     """
     return {
-        "body": build_body_section(keypoints, frame_idx, window_start, mouse_id),
+        "body": build_body_section(keypoints, scores, frame_idx, window_start, mouse_id),
         "interaction": build_interaction_section(
             keypoints, frame_idx, mouse_id, other_mouse_id, annotation_onehot
         ),
@@ -371,10 +407,20 @@ def build_annotation_onehot(annotation_id, vocab_order):
     """One-hot-encode a frame's annotation id, ordered by vocab_order (id order).
 
     把某一帧的标注 id 转换成 one-hot 列表，顺序按 vocab_order（即行为 id 顺序）。
-    e.g. with vocab_order = ["attack", "investigation", "mount", "other"],
-    a frame annotated as "investigation" (id 1) becomes [0, 1, 0, 0].
-    例如 vocab_order = ["attack", "investigation", "mount", "other"] 时，
-    标注为 "investigation"（id=1）的帧会变成 [0, 1, 0, 0]。
+    With CalMS21's vocab {'attack': 0, 'investigation': 1, 'mount': 2,
+    'other': 3}, vocab_order sorted by id is
+    ["attack", "investigation", "mount", "other"], which gives exactly:
+        attack        (id 0) -> [1, 0, 0, 0]
+        investigation (id 1) -> [0, 1, 0, 0]
+        mount         (id 2) -> [0, 0, 1, 0]
+        other         (id 3) -> [0, 0, 0, 1]
+    对于 CalMS21 的 vocab {'attack': 0, 'investigation': 1, 'mount': 2,
+    'other': 3}，按 id 排序后的 vocab_order 正好是
+    ["attack", "investigation", "mount", "other"]，因此：
+        attack        (id 0) -> [1, 0, 0, 0]
+        investigation (id 1) -> [0, 1, 0, 0]
+        mount         (id 2) -> [0, 0, 1, 0]
+        other         (id 3) -> [0, 0, 0, 1]
     """
     onehot = [0] * len(vocab_order)
     onehot[annotation_id] = 1
@@ -391,6 +437,7 @@ def build_window(sequence_data, window_start, window_end, vocab_order):
     组成的列表，对应 [window_start, window_end) 范围内的每一帧。
     """
     keypoints = sequence_data["keypoints"]
+    scores = sequence_data["scores"]
     annotations = sequence_data["annotations"]
 
     intruder_frames = []
@@ -403,6 +450,7 @@ def build_window(sequence_data, window_start, window_end, vocab_order):
 
         resident_frame = build_frame(
             keypoints,
+            scores,
             frame_idx,
             window_start,
             mouse_id=RESIDENT_ID,
@@ -411,6 +459,7 @@ def build_window(sequence_data, window_start, window_end, vocab_order):
         )
         intruder_frame = build_frame(
             keypoints,
+            scores,
             frame_idx,
             window_start,
             mouse_id=INTRUDER_ID,
