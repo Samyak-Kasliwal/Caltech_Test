@@ -1,0 +1,18 @@
+{
+  "sequence_id": "task1/train/mouse003_task1_annotator1",
+  "window_index": 0,
+  "start_t": 30,
+  "rollout_length": 50,
+  "target_branch": "intruder",
+  "context_branch": "resident",
+  "checkpoint_path": "Model/asymmetric_pose_case/runs/20260718_081453_asymmetric_pose/fold_01/checkpoints/best.pt",
+  "output_path": "Model/asymmetric_pose_case/runs/20260718_081453_asymmetric_pose/fold_01/rollouts/mouse003_start100_len50.npz",
+  "mode": "teacher_forced_windowed_one_step_export",
+  "metrics": {
+    "mean_mse": 11.118762969970703,
+    "mean_rmse": 2.933664321899414,
+    "mean_joint_l2": 3.596622943878174,
+    "final_frame_mse": 8.68053913116455,
+    "final_frame_rmse": 2.946275472640991
+  }
+}

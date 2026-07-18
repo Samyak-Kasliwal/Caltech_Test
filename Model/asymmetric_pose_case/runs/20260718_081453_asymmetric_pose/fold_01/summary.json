@@ -1,0 +1,9 @@
+{
+  "fold": 1,
+  "train_windows": 253528,
+  "val_windows": 54283,
+  "best_epoch": 47,
+  "best_val_mse": 0.4409815744341047,
+  "last_train_mse": 0.30390599423135534,
+  "last_val_mse": 0.4444525411149619
+}
