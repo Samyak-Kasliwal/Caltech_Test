@@ -52,6 +52,10 @@ def config_from_dict(payload: dict[str, Any]):
 def resolve_device(device_name: str) -> torch.device:
     if device_name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "TrainingConfig.device is set to 'cuda', but torch.cuda.is_available() is False."
+        )
     return torch.device(device_name)
 
 
@@ -77,36 +81,44 @@ def make_lengths(batch_size: int, length: int, device: torch.device) -> torch.Te
 def build_modules(cfg, device: torch.device) -> dict[str, nn.Module]:
     embedder = AsymmetricEmbeddingModule(cfg.data, cfg.embedding).to(device)
 
-    # A/B share one temporal model instance; interaction has its own branch.
-    # A/B 共用同一个时序模型实例；interaction 使用独立时序分支。
+    # A/B share one temporal model instance so Single/Multi keep matched capacity.
+    # A/B 共用同一个时序模型实例，使 Single/Multi 保持一致的时序建模容量。
     mouse_sequence = build_sequence_model(
         cfg.sequence.model_type,
         cfg.embedding.mouse_embedding_dim,
         cfg.sequence.hidden_dim,
         cfg.sequence,
     ).to(device)
-    interaction_sequence = build_sequence_model(
-        cfg.sequence.model_type,
-        cfg.embedding.interaction_embedding_dim,
-        cfg.sequence.interaction_hidden_dim,
-        cfg.sequence,
-    ).to(device)
-
     mouse_pooler = build_pooler(cfg.pooling, cfg.sequence, cfg.sequence.output_dim).to(device)
-    interaction_pooler = build_pooler(
-        cfg.pooling, cfg.sequence, cfg.sequence.interaction_output_dim
-    ).to(device)
 
     current_behavior_dim = (
         cfg.embedding.behavior_embedding_dim
         if cfg.data.behavior_label_mode == "history_plus_current"
         else 0
     )
-    head_input_dim = (
-        cfg.sequence.output_dim * 2
-        + cfg.sequence.interaction_output_dim
-        + current_behavior_dim
-    )
+    model_name = cfg.data.model_name.lower()
+    if model_name == "single_predict":
+        interaction_sequence = None
+        interaction_pooler = None
+        head_input_dim = cfg.sequence.output_dim + current_behavior_dim
+    elif model_name == "multi_predict":
+        interaction_sequence = build_sequence_model(
+            cfg.sequence.model_type,
+            cfg.embedding.interaction_embedding_dim,
+            cfg.sequence.interaction_hidden_dim,
+            cfg.sequence,
+        ).to(device)
+        interaction_pooler = build_pooler(
+            cfg.pooling, cfg.sequence, cfg.sequence.interaction_output_dim
+        ).to(device)
+        head_input_dim = (
+            cfg.sequence.output_dim * 2
+            + cfg.sequence.interaction_output_dim
+            + current_behavior_dim
+        )
+    else:
+        raise ValueError(f"Unsupported model_name: {cfg.data.model_name}")
+
     prediction_head = PoseDeltaPredictionHead(
         head_input_dim,
         cfg.head.hidden_dims,
@@ -117,10 +129,16 @@ def build_modules(cfg, device: torch.device) -> dict[str, nn.Module]:
     return {
         "embedder": embedder,
         "mouse_sequence": mouse_sequence,
-        "interaction_sequence": interaction_sequence,
         "mouse_pooler": mouse_pooler,
-        "interaction_pooler": interaction_pooler,
         "prediction_head": prediction_head,
+        **(
+            {
+                "interaction_sequence": interaction_sequence,
+                "interaction_pooler": interaction_pooler,
+            }
+            if model_name == "multi_predict"
+            else {}
+        ),
     }
 
 
@@ -136,33 +154,40 @@ def forward_batch(
     # 将原始坐标、速度和标签编码为 latent token。
     embedded = modules["embedder"](batch)
 
-    # Run temporal modeling over A, B, and interaction branches.
-    # 对 A、B、interaction 三个分支执行时序建模。
+    # Run temporal modeling over the target A branch.
+    # 对目标 A 分支执行时序建模。
     a_sequence = modules["mouse_sequence"](embedded["a"])
-    b_sequence = modules["mouse_sequence"](embedded["b"])
-    interaction_sequence = modules["interaction_sequence"](embedded["interaction"])
 
     a_lengths = make_lengths(batch_size, cfg.data.a_window_length, device)
-    b_lengths = make_lengths(batch_size, cfg.data.b_window_length, device)
-    interaction_lengths = make_lengths(batch_size, cfg.data.b_window_length, device)
 
-    # Pool each temporal branch into one fixed-size vector.
-    # 将每个时序分支聚合为一个固定维度向量。
+    # Pool temporal features into one fixed-size vector.
+    # 将时序特征聚合为固定维度向量。
     a_pooled = modules["mouse_pooler"](a_sequence, a_lengths)
-    b_pooled = modules["mouse_pooler"](b_sequence, b_lengths)
-    interaction_pooled = modules["interaction_pooler"](
-        interaction_sequence, interaction_lengths
-    )
 
-    fused_features = [a_pooled, b_pooled, interaction_pooled]
+    fused_features = [a_pooled]
+    if cfg.data.model_name.lower() == "multi_predict":
+        # Multi_predict additionally uses B context and interaction context.
+        # Multi_predict 额外使用 B 分支上下文和 interaction 上下文。
+        b_sequence = modules["mouse_sequence"](embedded["b"])
+        interaction_sequence = modules["interaction_sequence"](embedded["interaction"])
+        b_lengths = make_lengths(batch_size, cfg.data.b_window_length, device)
+        interaction_lengths = make_lengths(
+            batch_size, cfg.data.interaction_window_length, device
+        )
+        b_pooled = modules["mouse_pooler"](b_sequence, b_lengths)
+        interaction_pooled = modules["interaction_pooler"](
+            interaction_sequence, interaction_lengths
+        )
+        fused_features.extend([b_pooled, interaction_pooled])
+
     if cfg.data.behavior_label_mode == "history_plus_current":
         # Current annotation is a global condition, not an A/B-specific label.
         # 当前 annotation 是全局条件，不属于任意一只小鼠的私有标签。
         current_behavior = modules["embedder"].embed_behavior(batch["current_behavior"])
         fused_features.append(current_behavior)
 
-    # Predict B mouse current pose displacement B[t] - B[t-1].
-    # 预测 B 鼠当前姿态相对上一帧的位移 B[t] - B[t-1]。
+    # Predict target mouse current pose displacement A[t] - A[t-1].
+    # 预测目标鼠当前姿态相对上一帧的位移 A[t] - A[t-1]。
     return modules["prediction_head"](torch.cat(fused_features, dim=-1))
 
 
@@ -172,7 +197,7 @@ def normalizers_state_dict(normalizers) -> dict[str, dict[str, list[float]]]:
             "mean": getattr(normalizers, name).mean.cpu().tolist(),
             "std": getattr(normalizers, name).std.cpu().tolist(),
         }
-        for name in ("coord", "velocity", "interaction", "target_delta")
+        for name in ("coord", "velocity", "self_distance", "interaction", "target_delta")
     }
 
 
@@ -186,6 +211,7 @@ def normalizers_from_state_dict(state: dict[str, dict[str, list[float]]]) -> Nor
     return NormalizerBundle(
         coord=build("coord"),
         velocity=build("velocity"),
+        self_distance=build("self_distance"),
         interaction=build("interaction"),
         target_delta=build("target_delta"),
     )

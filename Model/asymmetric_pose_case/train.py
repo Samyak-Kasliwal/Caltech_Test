@@ -18,8 +18,11 @@ if __package__ is None or __package__ == "":
     from Model.asymmetric_pose_case.config import default_config
     from Model.asymmetric_pose_case.data import (
         CalMS21AsymmetricPoseDataset,
+        CachedCalMS21AsymmetricPoseDataset,
+        build_or_load_window_feature_cache,
         build_window_indices,
         fit_normalizers,
+        fit_normalizers_from_cache,
         load_calms21_sequences,
     )
     from Model.asymmetric_pose_case.kfold import build_kfold_splits
@@ -37,8 +40,11 @@ else:
     from .config import default_config
     from .data import (
         CalMS21AsymmetricPoseDataset,
+        CachedCalMS21AsymmetricPoseDataset,
+        build_or_load_window_feature_cache,
         build_window_indices,
         fit_normalizers,
+        fit_normalizers_from_cache,
         load_calms21_sequences,
     )
     from .kfold import build_kfold_splits
@@ -94,10 +100,14 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     cfg,
     device: torch.device,
+    fold_index: int,
+    epoch: int,
 ) -> float:
     for module in modules.values():
         module.train()
 
+    use_amp = cfg.training.use_amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     total_loss = 0.0
     total_count = 0
     for batch_index, batch in enumerate(loader):
@@ -105,12 +115,23 @@ def train_one_epoch(
             break
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        prediction = forward_batch(batch, modules, cfg, device)
-        loss = criterion(prediction, batch["target_delta"])
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            prediction = forward_batch(batch, modules, cfg, device)
+            loss = criterion(prediction, batch["target_delta"])
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item() * prediction.shape[0]
         total_count += prediction.shape[0]
+        if cfg.training.log_every_n_steps and (
+            (batch_index + 1) % cfg.training.log_every_n_steps == 0
+            or batch_index == 0
+        ):
+            running_loss = total_loss / max(total_count, 1)
+            print(
+                f"fold={fold_index} epoch={epoch} step={batch_index + 1}/{len(loader)} "
+                f"batch_mse={loss.item():.6f} running_mse={running_loss:.6f}"
+            )
 
     return total_loss / max(total_count, 1)
 
@@ -151,6 +172,19 @@ def make_optimizer(modules: dict[str, nn.Module], cfg) -> torch.optim.Optimizer:
     )
 
 
+def make_dataloader(dataset, cfg, device: torch.device, shuffle: bool) -> DataLoader:
+    kwargs = {
+        "batch_size": cfg.training.batch_size,
+        "shuffle": shuffle,
+        "num_workers": cfg.training.num_workers,
+        "pin_memory": device.type == "cuda" and cfg.training.pin_memory,
+    }
+    if cfg.training.num_workers > 0:
+        kwargs["prefetch_factor"] = cfg.training.prefetch_factor
+        kwargs["persistent_workers"] = cfg.training.persistent_workers
+    return DataLoader(dataset, **kwargs)
+
+
 def run_training(
     smoke_test: bool = False,
     epochs: int | None = None,
@@ -159,7 +193,20 @@ def run_training(
     num_folds: int | None = None,
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
+    holdout_val_ratio: float | None = None,
+    device_name: str | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    prefetch_factor: int | None = None,
+    use_amp: bool | None = None,
+    log_every_n_steps: int | None = None,
+    model_name: str | None = None,
+    history_frames: int | None = None,
+    target_branch: str | None = None,
+    context_branch: str | None = None,
     no_checkpoints: bool = False,
+    no_feature_cache: bool = False,
+    rebuild_feature_cache: bool = False,
 ) -> Path:
     cfg = default_config()
     if epochs is not None:
@@ -174,8 +221,32 @@ def run_training(
         cfg.training.max_train_batches = max_train_batches
     if max_val_batches is not None:
         cfg.training.max_val_batches = max_val_batches
+    if holdout_val_ratio is not None:
+        cfg.training.holdout_val_ratio = holdout_val_ratio
+    if device_name is not None:
+        cfg.training.device = device_name
+    if batch_size is not None:
+        cfg.training.batch_size = batch_size
+    if num_workers is not None:
+        cfg.training.num_workers = num_workers
+    if prefetch_factor is not None:
+        cfg.training.prefetch_factor = prefetch_factor
+    if use_amp is not None:
+        cfg.training.use_amp = use_amp
+    if log_every_n_steps is not None:
+        cfg.training.log_every_n_steps = log_every_n_steps
+    if model_name is not None:
+        cfg.data.model_name = model_name
+    if history_frames is not None:
+        cfg.data.history_frames = history_frames
+    if target_branch is not None:
+        cfg.data.target_branch = target_branch
+    if context_branch is not None:
+        cfg.data.context_branch = context_branch
     if no_checkpoints:
         cfg.training.save_checkpoints = False
+    if no_feature_cache:
+        cfg.training.use_feature_cache = False
 
     if smoke_test:
         cfg.training.epochs = 1
@@ -185,6 +256,16 @@ def run_training(
     set_seed(cfg.training.seed)
     device = resolve_device(cfg.training.device)
     print_preflight(device)
+    print(
+        "Training load config: "
+        f"batch_size={cfg.training.batch_size}, "
+        f"num_workers={cfg.training.num_workers}, "
+        f"pin_memory={cfg.training.pin_memory}, "
+        f"prefetch_factor={cfg.training.prefetch_factor}, "
+        f"persistent_workers={cfg.training.persistent_workers}, "
+        f"use_amp={cfg.training.use_amp}, "
+        f"use_feature_cache={cfg.training.use_feature_cache}"
+    )
 
     run_dir = create_run_dir(cfg)
 
@@ -199,6 +280,19 @@ def run_training(
     windows = build_window_indices(records, cfg.data)
     print(f"Loaded {len(records)} sequences and {len(windows)} windows.")
 
+    feature_cache = None
+    if cfg.training.use_feature_cache:
+        print("Feature cache: checking/building raw window feature cache...")
+        feature_cache = build_or_load_window_feature_cache(
+            records,
+            windows,
+            cfg.data,
+            rebuild=rebuild_feature_cache,
+        )
+        print(f"Feature cache: {feature_cache.status} at {feature_cache.path}")
+    else:
+        print("Feature cache: disabled")
+
     # Build train/validation folds by sequence_id to avoid leakage.
     # 按 sequence_id 构建训练/验证折，避免重叠窗口泄露。
     folds = build_kfold_splits(
@@ -207,6 +301,7 @@ def run_training(
         cfg.training.split_mode,
         cfg.training.num_folds,
         cfg.training.seed,
+        cfg.training.holdout_val_ratio,
     )
 
     all_fold_summaries: list[dict[str, Any]] = []
@@ -229,29 +324,35 @@ def run_training(
 
         # Fit normalization statistics on the train fold only.
         # 只在当前训练折上拟合归一化统计量，避免验证集信息泄露。
-        normalizers = fit_normalizers(
-            records, train_windows, cfg.data, cfg.normalization
-        )
-        train_dataset = CalMS21AsymmetricPoseDataset(
-            records, train_windows, cfg.data, normalizers
-        )
-        val_dataset = CalMS21AsymmetricPoseDataset(
-            records, val_windows, cfg.data, normalizers
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=True,
-            num_workers=cfg.training.num_workers,
-            pin_memory=device.type == "cuda",
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=False,
-            num_workers=cfg.training.num_workers,
-            pin_memory=device.type == "cuda",
-        )
+        if feature_cache is not None:
+            train_rows = feature_cache.row_indices(train_windows)
+            val_rows = feature_cache.row_indices(val_windows)
+            normalizers = fit_normalizers_from_cache(
+                feature_cache,
+                train_rows,
+                cfg.data,
+                cfg.normalization,
+            )
+            train_dataset = CachedCalMS21AsymmetricPoseDataset(
+                feature_cache, train_rows, normalizers
+            )
+            val_dataset = CachedCalMS21AsymmetricPoseDataset(
+                feature_cache, val_rows, normalizers
+            )
+        else:
+            normalizers = fit_normalizers(
+                records, train_windows, cfg.data, cfg.normalization
+            )
+            train_dataset = CalMS21AsymmetricPoseDataset(
+                records, train_windows, cfg.data, normalizers
+            )
+            val_dataset = CalMS21AsymmetricPoseDataset(
+                records, val_windows, cfg.data, normalizers
+            )
+        # DataLoader parallelism controls CPU-side loading pressure.
+        # DataLoader 并行参数控制 CPU 侧数据加载压力。
+        train_loader = make_dataloader(train_dataset, cfg, device, shuffle=True)
+        val_loader = make_dataloader(val_dataset, cfg, device, shuffle=False)
 
         modules = build_modules(cfg, device)
         criterion = build_loss("mse").to(device)
@@ -261,7 +362,14 @@ def run_training(
         best_val_loss = float("inf")
         for epoch in range(cfg.training.epochs):
             train_loss = train_one_epoch(
-                train_loader, modules, criterion, optimizer, cfg, device
+                train_loader,
+                modules,
+                criterion,
+                optimizer,
+                cfg,
+                device,
+                fold.fold_index + 1,
+                epoch + 1,
             )
             val_loss = evaluate(val_loader, modules, criterion, cfg, device)
             epoch_metrics = {
@@ -336,6 +444,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None, help="Override epoch count.")
     parser.add_argument("--num-folds", type=int, default=None, help="Override k-fold count.")
     parser.add_argument(
+        "--holdout-val-ratio",
+        type=float,
+        default=None,
+        help="Validation ratio used when --num-folds 1.",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=None,
@@ -359,10 +473,67 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional validation batch limit for quick trial runs.",
     )
+    parser.add_argument("--device", type=str, default=None, help="Override device: auto/cpu/cuda.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override DataLoader workers.")
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=None,
+        help="Override DataLoader prefetch factor when num_workers > 0.",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Enable CUDA automatic mixed precision.",
+    )
+    parser.add_argument(
+        "--log-every-n-steps",
+        type=int,
+        default=None,
+        help="Print batch-level loss every N training steps.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        choices=["single_predict", "multi_predict"],
+        help="Select Single_predict or Multi_predict architecture.",
+    )
+    parser.add_argument(
+        "--history-frames",
+        type=int,
+        default=None,
+        help="Override the number of historical frames.",
+    )
+    parser.add_argument(
+        "--target-branch",
+        type=str,
+        default=None,
+        choices=["intruder", "resident"],
+        help="Branch to predict.",
+    )
+    parser.add_argument(
+        "--context-branch",
+        type=str,
+        default=None,
+        choices=["intruder", "resident"],
+        help="Context branch used by Multi_predict.",
+    )
     parser.add_argument(
         "--no-checkpoints",
         action="store_true",
         help="Save config and metrics only, without model checkpoint files.",
+    )
+    parser.add_argument(
+        "--no-feature-cache",
+        action="store_true",
+        help="Disable raw window feature cache and use on-the-fly extraction.",
+    )
+    parser.add_argument(
+        "--rebuild-feature-cache",
+        action="store_true",
+        help="Force rebuilding the raw window feature cache for this data/config.",
     )
     return parser.parse_args()
 
@@ -377,5 +548,18 @@ if __name__ == "__main__":
         num_folds=args.num_folds,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
+        holdout_val_ratio=args.holdout_val_ratio,
+        device_name=args.device,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        use_amp=True if args.use_amp else None,
+        log_every_n_steps=args.log_every_n_steps,
+        model_name=args.model_name,
+        history_frames=args.history_frames,
+        target_branch=args.target_branch,
+        context_branch=args.context_branch,
         no_checkpoints=args.no_checkpoints,
+        no_feature_cache=args.no_feature_cache,
+        rebuild_feature_cache=args.rebuild_feature_cache,
     )
