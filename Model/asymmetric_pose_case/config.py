@@ -62,8 +62,8 @@ class SequenceConfig:
     interaction_input_dim: int = 32
     hidden_dim: int = 128
     interaction_hidden_dim: int = 64
-    num_layers: int = 1
-    dropout: float = 0.0
+    num_layers: int = 2
+    dropout: float = 0.2
     bidirectional: bool = False
 
     @property
@@ -85,7 +85,7 @@ class PoolingConfig:
 class HeadConfig:
     hidden_dims: tuple[int, ...] = (256, 128)
     output_dim: int = 14
-    dropout: float = 0.0
+    dropout: float = 0.1
 
 
 @dataclass
@@ -99,7 +99,7 @@ class TrainingConfig:
     # Larger batch_size usually increases GPU utilization but also uses more VRAM.
     # 增大 batch_size 通常能提高 GPU 利用率，但会占用更多显存。
     batch_size: int = 256
-    epochs: int = 5
+    epochs: int = 50
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     # More workers can speed up data loading, but too many may overload CPU/RAM.

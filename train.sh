@@ -24,5 +24,4 @@
 # --batch-size 1024 --num-workers 4 --prefetch-factor 4 --use-amp
 # --batch-size 2048 --num-workers 4 --prefetch-factor 4 --use-amp
 
-# python -m Model.asymmetric_pose_case.train --device cuda --batch-size 1024 --num-workers 4 --prefetch-factor 4 --use-amp
-python -m Model.asymmetric_pose_case.train --device cuda --batch-size 2048 --num-workers 8 --prefetch-factor 2 --use-amp
+python -m Model.asymmetric_pose_case.train --device cuda --batch-size 8192 --num-workers 8 --prefetch-factor 1 --use-amp

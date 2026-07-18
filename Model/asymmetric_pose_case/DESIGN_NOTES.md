@@ -1,510 +1,553 @@
-# CalMS21 非对称姿态预测训练流程设计说明
+# CalMS21 Asymmetric Pose Prediction Design Notes
 
-本文档记录本轮讨论形成的训练方案和关键约束，供后续任务读取和继续开发。
+This document records the current design of `Model/asymmetric_pose_case` so future
+changes can stay aligned with the implemented training path.
 
-## 1. 实验目标
+## 1. Task Goal
 
-当前任务不是行为分类，而是 **预测 B 鼠当前姿态**。
+The current task is pose delta prediction, not behavior classification.
 
-对每个目标时刻 `t`：
-
-```text
-A 输入: A[t-9 : t]       # A 鼠历史 9 帧 + 当前 1 帧，共 10 帧
-B 输入: B[t-4 : t-1]     # B 鼠只提供历史 4 帧，不提供当前帧
-目标:   B[t] - B[t-1]     # 预测 B 鼠当前姿态相对上一帧的位移
-```
-
-目标输出维度为 `14`，对应 B 鼠 7 个 joint 的 `(x, y)` 位移。
-
-这个任务是一个条件预测任务：允许使用 `A[t]`，但不允许使用 `B[t]` 的姿态作为输入。
-
-## 2. 数据来源
-
-当前训练数据来自：
+For each target time `t`, the model predicts the current pose displacement of the
+configured target branch:
 
 ```text
-Caltech/calms21_task1_train_distance_lt_330.npy
+target_delta = target_pose[t] - target_pose[t - 1]
 ```
 
-该文件由：
+Default branch configuration:
 
 ```text
-Caltech/caltech_preprocess.py
+target_branch  = "intruder"
+context_branch = "resident"
 ```
 
-从原始 `calms21_task1_train.npy` 生成。预处理逻辑是保留两只鼠中心点距离 `< 330` 像素的帧。
+The output dimension is `14`, corresponding to 7 joints times `(x, y)`.
 
-数据结构大致为：
+The model supports two architecture modes:
+
+```text
+single_predict: use target branch history plus optional current behavior condition
+multi_predict:  additionally use context branch and interaction sequence
+```
+
+The default is:
+
+```text
+model_name = "multi_predict"
+```
+
+## 2. Data Source
+
+Current training data comes from the windowed preprocessed file:
+
+```text
+Caltech/calms21_task1_train_windowed_distance_lt_330.npy
+```
+
+This file is already transformed into trial windows and filtered by mouse distance.
+The loaded Python object is keyed by `sequence_id`:
 
 ```python
 {
-  "annotator-id_0": {
-    "task1/train/mouse001_task1_annotator1": {
-      "keypoints": ...,
-      "scores": ...,
-      "annotations": ...,
-      "metadata": ...
-    },
+  "task1/train/mouse001_task1_annotator1": [
+    [
+      [intruder_frame_0, intruder_frame_1, ...],
+      [resident_frame_0, resident_frame_1, ...],
+    ],
     ...
-  }
+  ],
+  ...
 }
 ```
 
-关键字段：
+Branch index convention:
 
 ```text
-keypoints:   shape = (frames, 2, 2, 7)
-scores:      shape = (frames, 2, 7)
-annotations: shape = (frames,)
+0: intruder
+1: resident
 ```
 
-`keypoints` 索引含义：
+Each frame contains pose, velocity, self-distance, and interaction metadata:
 
 ```text
-keypoints[frame, mouse_id, coord, joint_id]
+body.node.<joint>.position
+body.node.<joint>.node_velocity
+body.internode_distance
+interaction.annotation_tag
+interaction.intruder_or_resident_tag
+interaction.mouse_midpoint_distance
+interaction.head_angle
 ```
 
-其中：
+The directory `Caltech/task1_classic_classification/` comes from the official
+CalMS21 task1 behavior-classification starter kit. It is a source artifact name,
+not the current training objective.
+
+## 3. Module Layout
+
+The package is intentionally split into small modules:
 
 ```text
-mouse_id = 0: A / resident
-mouse_id = 1: B / intruder
-coord = 0: x
-coord = 1: y
-joint_id = 0..6
+config.py          dataclass configuration
+data.py            data loading, window indices, raw feature cache, datasets, normalization
+embeddings.py      target/context/interaction embedding modules
+sequence_models.py LSTM/GRU sequence model factory
+pooling.py         last/mean/attention-style pooling
+heads.py           pose delta prediction head
+losses.py          loss factory
+kfold.py           train/validation split construction
+runtime.py         runtime helpers, checkpoint IO, device movement
+train.py           end-to-end training orchestration
 ```
 
-行为标签 vocab：
-
-```text
-attack:        0
-investigation: 1
-mount:         2
-other:         3
-```
-
-## 3. 模块化目录结构
-
-训练流程拆分为多个文件，而不是全部写在一个大文件中：
-
-```text
-Model/asymmetric_pose_case/
-  config.py
-  data.py
-  embeddings.py
-  sequence_models.py
-  pooling.py
-  heads.py
-  losses.py
-  kfold.py
-  train.py
-  DESIGN_NOTES.md
-```
-
-各文件职责：
-
-```text
-config.py          集中 dataclass 配置
-data.py            数据读取、窗口构建、特征计算、归一化
-embeddings.py      embedding 子模块
-sequence_models.py LSTM/GRU 等时序模型接口
-pooling.py         last / mean / attention pooling
-heads.py           prediction head
-losses.py          loss 构建
-kfold.py           k-fold 划分
-train.py           串联完整训练流程
-```
-
-`train.py` 只负责显式串联流程：
+High-level training flow:
 
 ```text
 config
-  -> data
-  -> k-fold split
-  -> embedding
-  -> sequence model
-  -> pooling
-  -> prediction head
-  -> loss
-  -> optimizer
+  -> load records
+  -> build full window index list
+  -> build/load raw feature cache
+  -> build train/validation split
+  -> fit fold normalizers from train rows only
+  -> cached train/validation datasets
+  -> model / loss / optimizer
+  -> train, evaluate, checkpoint
 ```
 
-## 4. 配置化要求
+## 4. Configuration
 
-实现必须是 configuration-driven。
-
-所有关键参数都应集中在 `config.py` 的 dataclass 中，而不是散落硬编码在模块内部。
-
-包括但不限于：
+Important `DataConfig` fields:
 
 ```text
-A history length
-B history length
-joint embedding dim
-pose embedding dim
-velocity embedding dim
-behavior embedding dim
-mouse embedding dim
-interaction embedding dim
-sequence hidden dim
-prediction head hidden dims
-pooling type
+data_path
+feature_cache_dir = "Caltech/cache"
+model_name
+target_branch
+context_branch
+history_frames
+include_context_current
+include_interaction_current
 behavior_label_mode
 use_scores
-num_folds
-split_mode
+```
+
+Important `TrainingConfig` fields:
+
+```text
+num_folds = 1
+split_mode = "sequence_level"
+holdout_val_ratio = 0.2
 batch_size
-learning_rate
 epochs
+learning_rate
+num_workers
+pin_memory
+prefetch_factor
+persistent_workers
+use_amp
+use_feature_cache = True
+save_checkpoints
 ```
 
-这样后续做 ablation study 或替换模块时，只需要改配置或替换对应模块。
-
-## 5. Embedding 输入特征
-
-当前确认的 embedding 输入特征包括：
+CLI overrides are exposed in `train.py`, including:
 
 ```text
-1. 每只鼠 7 个 joint 的 xy 坐标
-2. 每只鼠 7 个 joint 的速度
-3. 两只鼠中心点差值 B_center - A_center
-4. 两只鼠中心点距离 ||B_center - A_center||
-5. 两只鼠面朝方向夹角
-6. annotation 信息
+--device
+--batch-size
+--num-workers
+--prefetch-factor
+--use-amp
+--num-folds
+--holdout-val-ratio
+--no-feature-cache
+--rebuild-feature-cache
+--no-checkpoints
 ```
 
-### 5.1 Joint xy
+## 5. Window Construction
 
-每只鼠每一帧有 7 个 joint，每个 joint 是 `(x, y)`。
-
-在 embedding 中：
+`build_window_indices(records, data_config)` creates a flat list of `WindowIndex`:
 
 ```text
-JointEncoder: (x, y) -> joint latent
-PoseEncoder:  7 个 joint latent -> pose embedding
+sequence_index
+window_index
+target_t
 ```
 
-`JointEncoder` 在所有 joint、A 鼠、B 鼠之间共享参数。
-
-### 5.2 Joint velocity
-
-每个 joint 的速度使用相邻帧差值：
+The minimum valid `target_t` is:
 
 ```text
-velocity[k] = xy[k] - xy[k-1]
+history_frames
 ```
 
-对于 B 分支，最后一个可用时刻是 `t-1`，因此：
+Default temporal lengths:
 
 ```text
-B 在 t-1 的速度 = B[t-1] - B[t-2]
+target branch history:      history_frames
+context branch sequence:    history_frames + include_context_current
+interaction sequence:       history_frames + include_interaction_current
 ```
 
-这样不会泄露目标帧 `B[t]`。
-
-对于 A 分支，因为输入包含 `A[t]`，所以可以使用：
+With the current defaults:
 
 ```text
-A 在 t 的速度 = A[t] - A[t-1]
+history_frames = 9
+include_context_current = True
+include_interaction_current = True
 ```
 
-### 5.3 Center delta 和 center distance
-
-每只鼠中心点定义为该鼠 7 个 joint 坐标的平均值：
+The logs from the current dataset show roughly:
 
 ```text
-center = mean(joint xy over 7 joints)
+70 sequences
+307811 windows
 ```
 
-交互特征包括：
+## 6. Raw Feature Cache
+
+The current training path uses an automatic raw feature cache to avoid repeatedly
+extracting nested Python `dict/list` window features inside every DataLoader worker.
+
+Default cache root:
 
 ```text
-center_delta = B_center - A_center
-center_distance = ||center_delta||
+Caltech/cache
 ```
 
-中心差值和 joint xy 存在信息冗余，但它能显式提供两只鼠相对位置，是有用的 inductive bias。
-
-### 5.4 面朝方向夹角
-
-朝向向量使用：
+Cache directory format:
 
 ```text
-heading = nose - neck
+Caltech/cache/asymmetric_pose_<hash>/
+  manifest.json
+  a_xy.npy
+  a_velocity.npy
+  a_self_distance.npy
+  a_behavior.npy
+  a_role.npy
+  b_xy.npy
+  b_velocity.npy
+  b_self_distance.npy
+  b_behavior.npy
+  b_role.npy
+  interaction.npy
+  current_behavior.npy
+  target_delta.npy
+  previous_pose.npy
+  target_pose.npy
+  target_t.npy
+  sequence_index.npy
+  window_index.npy
 ```
 
-其中：
+The cache stores raw, unnormalized features. Fold-specific normalization is still
+fit later using only the current fold's train rows.
+
+The manifest/key includes:
 
 ```text
-nose joint index = 0
-neck joint index = 3
+preprocess_version
+source data path
+source file size
+source mtime
+target_branch
+context_branch
+history_frames
+include_context_current
+include_interaction_current
+num_joints
+coord_dim
+num_self_distances
+sequence_ids
 ```
 
-两只鼠的朝向夹角不直接用角度值，而是编码为：
+Cache behavior:
 
 ```text
-sin(delta_angle)
-cos(delta_angle)
+use_feature_cache=True: build/load cache automatically
+--no-feature-cache:     use old on-the-fly extraction dataset
+--rebuild-feature-cache: force rebuild for the current data/config key
 ```
 
-这样可以避免角度在 `pi` 和 `-pi` 附近发生数值跳变。
+The cache is built once before k-fold training. Each fold maps its
+`train_windows` and `val_windows` to cache row indices, so k-fold does not repeat
+raw feature extraction for the same window.
 
-### 5.5 Annotation
+## 7. Feature Semantics
 
-`annotations` 是全局交互/行为标签，不是 A 鼠或 B 鼠各自的私有标签。
-
-annotation 使用 `nn.Embedding` 编码，而不是作为连续数值输入。
-
-配置项：
+Target branch features:
 
 ```text
-behavior_label_mode = "history_plus_current" | "history_only" | "none"
+a_xy
+a_velocity
+a_self_distance
+a_behavior
+a_role
 ```
 
-含义：
+Context branch features:
 
 ```text
-history_plus_current: 历史 annotation 和当前 annotation 都可作为条件输入
-history_only:         只使用历史 annotation
-none:                 不使用 annotation
+b_xy
+b_velocity
+b_self_distance
+b_behavior
+b_role
 ```
 
-当前默认使用：
+Interaction features are 7-dimensional per frame:
 
 ```text
-behavior_label_mode = "history_plus_current"
+context_center - target_center
+mouse_midpoint_distance
+sin(target_head_angle)
+cos(target_head_angle)
+sin(context_head_angle)
+cos(context_head_angle)
 ```
 
-此时当前 annotation 是一个 global condition，会在最终 head 前拼接，而不是作为 A 或 B 的私有特征。
+Behavior labels come from `interaction.annotation_tag` using `argmax`.
+Role labels come from `interaction.intruder_or_resident_tag`.
 
-## 6. 暂不使用 scores
+The current implementation allows `include_interaction_current=True`, which means
+the interaction sequence includes the target time `t`. This is a conditional
+prediction design choice in the current code and should be reviewed carefully
+before treating validation metrics as pure future-pose forecasting metrics.
 
-`scores` 是姿态检测器给每个 keypoint 的置信度，shape 为：
+## 8. Embedding, Sequence Model, Pooling, Head
+
+Embedding hierarchy:
 
 ```text
-(frames, 2, 7)
+joint xy          -> JointEncoder -> PoseEncoder
+joint velocity    -> VelocityJointEncoder -> VelocityEncoder
+self distance     -> SelfDistanceEncoder
+behavior label    -> BehaviorEmbedding
+role label        -> RoleEmbedding
+mouse features    -> MouseEncoder
+interaction       -> InteractionEncoder
 ```
 
-它表示每个关键点坐标的检测可信程度。
+Target and context branches share the same mouse embedding and temporal model
+weights so both branches live in the same latent space.
 
-当前第一版不使用 `scores`。
-
-后续可以考虑两种扩展：
-
-```text
-1. 将 joint 输入从 (x, y) 改为 (x, y, score)
-2. 新增独立 ScoreEncoder，再与 pose / velocity / annotation 融合
-```
-
-## 7. Embedding 层级结构
-
-当前 embedding 设计为：
-
-```text
-Joint -> Pose -> Mouse
-Velocity Joint -> Velocity -> Mouse
-Annotation -> Mouse / Global condition
-Interaction -> Interaction Embedding
-```
-
-鼠标分支：
-
-```text
-joint xy
-  -> JointEncoder
-  -> PoseEncoder
-
-joint velocity
-  -> VelocityJointEncoder
-  -> VelocityEncoder
-
-annotation
-  -> BehaviorEmbedding
-
-pose + velocity + behavior
-  -> MouseEncoder
-  -> Mouse Embedding
-```
-
-交互分支：
-
-```text
-center delta
-center distance
-facing angle sin/cos
-  -> InteractionEncoder
-  -> Interaction Embedding
-```
-
-A/B 共用同一套 mouse embedding 参数，确保两只鼠处于同一个 latent feature space。
-
-Interaction 作为独立模态，不提前合并到任意一只鼠中。
-
-## 8. 时序模型、Pooling 和 Head
-
-当前默认时序模型：
+Default temporal model:
 
 ```text
 LSTM
 ```
 
-A 分支和 B 分支共享 sequence model。
-
-Interaction 分支使用独立 sequence branch。
-
-流程：
+Default multi-predict flow:
 
 ```text
-A mouse embeddings
-  -> shared sequence model
-  -> pooling
+target mouse embeddings
+  -> shared mouse sequence model
+  -> mouse pooler
 
-B mouse embeddings
-  -> shared sequence model
-  -> pooling
+context mouse embeddings
+  -> shared mouse sequence model
+  -> mouse pooler
 
 interaction embeddings
   -> interaction sequence model
-  -> pooling
+  -> interaction pooler
 
-A pooled + B pooled + interaction pooled + optional current annotation embedding
+target pooled + context pooled + interaction pooled + optional current behavior
   -> prediction head
-  -> predicted B pose delta
+  -> normalized target_delta prediction
 ```
 
-Pooling 默认策略：
-
-```text
-LSTM: last valid hidden step
-其他模型: mask mean pooling
-```
-
-后续可替换为 attention pooling。
-
-Prediction Head 输出：
-
-```text
-14-dimensional normalized delta
-```
-
-Loss：
+Loss:
 
 ```text
 MSELoss
 ```
 
-Loss 模块保持可替换，后续可以换成 SmoothL1 / Huber / weighted loss。
+## 9. Train/Validation Splits
 
-## 9. K-fold 策略
-
-默认使用：
+Supported split modes:
 
 ```text
-5-fold sequence-level cross validation
+sequence_level
+window_level
 ```
 
-当前数据大约有：
+Default:
 
 ```text
-70 条 sequence
-322,522 个窗口样本
+split_mode = "sequence_level"
+num_folds = 1
+holdout_val_ratio = 0.2
 ```
 
-5-fold 时，每折大约：
+When `num_folds == 1`, the code creates a single holdout validation split using
+`holdout_val_ratio`; it does not put all windows into validation.
+
+When `num_folds > 1`, sequence-level k-fold shuffles sequence indices using the
+configured seed and assigns each fold's validation sequences by round-robin.
+
+For sequence-level split, a `sequence_id` must not appear in both train and
+validation for the same fold.
+
+Window-level split is retained for experiments, but it can leak highly overlapping
+neighbor windows between train and validation and should not be used for the main
+reported metrics.
+
+## 10. Normalization
+
+Continuous features are normalized using mean/std fit on the current fold's
+training rows only.
+
+Normalized groups:
 
 ```text
-14 条 sequence 做 validation
-56 条 sequence 做 training
+coord:          a_xy, b_xy
+velocity:       a_velocity, b_velocity
+self_distance:  a_self_distance, b_self_distance
+interaction:    interaction
+target_delta:   target_delta
 ```
 
-采用 sequence-level split 的原因：
+Validation rows never contribute to normalizer statistics.
+
+With feature cache enabled, normalizers are fit by `fit_normalizers_from_cache()`
+using chunked row reads to avoid materializing the whole fold at once.
+
+## 11. Performance Notes
+
+The raw feature cache removes the original bottleneck of repeatedly parsing nested
+window dictionaries inside DataLoader workers.
+
+Observed current bottlenecks after cache:
 
 ```text
-同一条 sequence 内的相邻窗口高度重叠。
-如果按 window 随机划分，相邻窗口可能同时出现在 train 和 validation，
-导致验证集结果偏乐观。
+large batch + many workers can exhaust Docker /dev/shm
+default_collate still stacks many per-sample tensors
+worker shared-memory transfer can bottleneck before GPU compute
 ```
 
-因此默认按 `sequence_id` 划分。
+Stable CUDA starting point:
 
-同时代码中保留 window-level split 选项，方便后续对比：
+```bash
+python -m Model.asymmetric_pose_case.train \
+  --device cuda \
+  --batch-size 2048 \
+  --num-workers 4 \
+  --prefetch-factor 1 \
+  --use-amp
+```
+
+Larger batches reduce `steps_per_epoch`:
 
 ```text
-split_mode = "sequence_level" | "window_level"
+steps_per_epoch ~= train_windows / batch_size
 ```
 
-## 10. 归一化
-
-连续变量使用 train fold 的 mean/std 做归一化。
-
-需要归一化的内容：
+For fair comparisons, scale epochs with batch size if the goal is to keep optimizer
+update count similar:
 
 ```text
-joint xy
-joint velocity
-interaction features
-target delta
+1024 batch, 5 epochs   ~= baseline update count
+2048 batch, 10 epochs  ~= similar updates
+4096 batch, 20 epochs  ~= similar updates
+8192 batch, 40 epochs  ~= similar updates
 ```
 
-归一化统计量只在当前 fold 的训练集上拟合，避免验证集信息泄露。
+If using Docker, increase shared memory for aggressive DataLoader settings:
 
-## 11. 关键防泄露约束
+```bash
+docker run --shm-size=8g ...
+# or
+docker run --ipc=host ...
+```
 
-必须保证：
+Future performance improvement: implement a batch-level cached loader or custom
+collate path that slices cache arrays by a whole batch of row indices at once,
+rather than building and collating many per-sample tensors.
+
+## 12. Checkpoints
+
+`save_checkpoint()` currently writes:
 
 ```text
-1. B[t] pose 只能作为 target，不能进入输入。
-2. B[t-1] velocity = B[t-1] - B[t-2]，不能用 B[t] - B[t-1]。
-3. 如果 behavior_label_mode = history_only，则不能输入当前 annotation。
-4. 如果 behavior_label_mode = history_plus_current，则当前 annotation 是显式 global condition。
-5. validation fold 的 normalization 不能参与统计量拟合。
-6. sequence-level k-fold 下，同一个 sequence_id 不能同时出现在 train 和 validation。
+fold
+epoch
+train_mse
+val_mse
+config
+normalizers
+module state_dicts
+optimizer state_dict
 ```
 
-## 12. 中英文注释要求
+The checkpoint files are saved under:
 
-关键调用步骤需要添加简洁的中英文注释，说明该调用在做什么。
-
-例如：
-
-```python
-# Build train/validation folds by sequence_id to avoid leakage.
-# 按 sequence_id 构建训练/验证折，避免重叠窗口泄露。
-folds = build_kfold_splits(...)
-
-# Encode raw coordinates, velocities, and labels into latent tokens.
-# 将原始坐标、速度和标签编码为 latent token。
-embedded = embedder(batch)
-
-# Predict B mouse current pose displacement B[t] - B[t-1].
-# 预测 B 鼠当前姿态相对上一帧的位移 B[t] - B[t-1]。
-prediction = prediction_head(...)
+```text
+<run_dir>/fold_XX/checkpoints/last.pt
+<run_dir>/fold_XX/checkpoints/best.pt
 ```
 
-注释应解释关键数据流和设计决策，不需要给每一行代码都写注释。
+On Docker bind mounts backed by Windows, `torch.save()` can occasionally fail when
+opening or replacing `.pt` files. If checkpoint IO fails but training itself is
+stable, use `--no-checkpoints` to confirm the issue is IO-only, or write
+`--output-root` to a native Linux path such as `/tmp/asymmetric_pose_runs`.
 
-## 13. 当前实现验证方式
+Recommended future hardening: save to a temporary checkpoint file first, then
+atomically replace `last.pt` or `best.pt`; optionally fall back to legacy PyTorch
+serialization if the default zip writer fails on a mounted filesystem.
 
-快速 smoke test：
+## 13. Safety Constraints
 
-```powershell
-python -m Model.asymmetric_pose_case.train --smoke-test
+Important invariants:
+
+```text
+normalization statistics must use train rows only
+sequence-level split must not leak the same sequence_id into train and validation
+raw feature cache must not store fold-normalized features
+cache key must change when feature extraction semantics change
+window-level split should not be used for final leakage-sensitive metrics
 ```
 
-语法检查：
+The current interaction-current design can include target-time interaction
+features. Treat that as an explicit modeling choice; changing it requires updating
+the cache preprocess version and rebuilding the cache.
 
-```powershell
-python -m compileall Model\asymmetric_pose_case
+## 14. Verification
+
+Fast syntax check:
+
+```bash
+python -m py_compile \
+  Model/asymmetric_pose_case/config.py \
+  Model/asymmetric_pose_case/data.py \
+  Model/asymmetric_pose_case/train.py
 ```
 
-完整训练：
+Fallback smoke test without cache:
 
-```powershell
-python -m Model.asymmetric_pose_case.train
+```bash
+python -m Model.asymmetric_pose_case.train \
+  --smoke-test \
+  --device cpu \
+  --no-feature-cache \
+  --no-checkpoints
 ```
 
-当前 Windows Python 环境是 CPU-only PyTorch；如果在 Docker 中训练，需要确保 Docker 内部安装了 Python 和 CUDA 版 PyTorch，并在训练开始前检查：
+Cached smoke test:
 
-```python
-torch.cuda.is_available()
+```bash
+python -m Model.asymmetric_pose_case.train \
+  --smoke-test \
+  --device cpu \
+  --no-checkpoints
+```
+
+CUDA training example:
+
+```bash
+python -m Model.asymmetric_pose_case.train \
+  --device cuda \
+  --batch-size 2048 \
+  --num-workers 4 \
+  --prefetch-factor 1 \
+  --use-amp
 ```
