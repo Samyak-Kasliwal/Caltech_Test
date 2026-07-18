@@ -1,0 +1,5 @@
+*.npy
+*.json
+./cache
+./task1_classic_classification
+# !.gitignore
